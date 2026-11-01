@@ -1,0 +1,46 @@
+{
+  "applicationId": "com.biliflow.desktop",
+  "version": "0.1.0",
+  "defaultMode": "window",
+  "applicationName": "BiliFlow",
+  "description": "A lightweight, local-first video downloader for Windows.",
+  "port": 0,
+  "documentRoot": "/dist/",
+  "url": "/",
+  "enableServer": true,
+  "enableNativeAPI": true,
+  "singlePageServe": true,
+  "tokenSecurity": "one-time",
+  "nativeAllowList": ["app.*", "window.*", "debug.log"],
+  "modes": {
+    "window": {
+      "title": "BiliFlow",
+      "width": 1180,
+      "height": 760,
+      "minWidth": 900,
+      "minHeight": 600,
+      "center": true,
+      "resizable": true,
+      "useLogicalPixels": true,
+      "useSavedState": false,
+      "enableInspector": true,
+      "exitProcessOnClose": true,
+      "injectGlobals": true
+    }
+  },
+  "cli": {
+    "binaryName": "biliflow",
+    "resourcesPath": "/dist/",
+    "binaryVersion": "6.10.0",
+    "clientVersion": "6.10.0",
+    "distributionPath": "/release",
+    "frontendLibrary": {
+      "patchFile": "/index.html",
+      "devUrl": "http://localhost:5173",
+      "projectPath": "./",
+      "devCommand": "npm run dev",
+      "buildCommand": "npm run build",
+      "waitTimeout": 60000
+    }
+  }
+}
