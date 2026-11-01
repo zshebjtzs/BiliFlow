@@ -25,6 +25,10 @@ export interface NativeProcessEvent {
   detail: unknown
 }
 
+export interface ExecCommandResult {
+  exitCode: number
+}
+
 export interface ProcessRunnerDependencies {
   getAppPath: () => string
   spawnProcess: (
@@ -32,6 +36,7 @@ export interface ProcessRunnerDependencies {
     options?: SpawnProcessOptions,
   ) => Promise<SpawnedProcessInfo>
   updateSpawnedProcess: (id: number, event: string, data?: unknown) => Promise<void>
+  execCommand: (command: string) => Promise<ExecCommandResult>
   getEnvs: () => Promise<Record<string, string>>
   getStats: (path: string) => Promise<ExecutableStats>
   on: (event: string, handler: (event: NativeProcessEvent) => void) => Promise<unknown>
@@ -57,6 +62,10 @@ export interface DownloadProcessRunner {
   cancelDownload: (processId: number) => Promise<boolean>
   onOutput: (listener: DownloadOutputListener) => () => void
   onExit: (listener: DownloadExitListener) => () => void
+  /**
+   * Stops accepting downloads, terminates tracked processes (including one
+   * whose spawn response is still in flight), and removes the native listener.
+   */
   dispose: () => Promise<void>
 }
 
@@ -87,6 +96,7 @@ export class DownloadProcessError extends Error {
 
 interface RunningProcess {
   id: number
+  pid: number
   cancelRequested: boolean
 }
 
@@ -96,8 +106,26 @@ interface QueuedEvent {
   data: unknown
 }
 
+interface SpawnAttempt {
+  readonly done: Promise<void>
+  resolve: () => void
+  cleanupError?: DownloadProcessError
+}
+
 const SPAWNED_PROCESS_EVENT = 'spawnedProcess'
 const MAX_BUFFERED_EVENTS_PER_PROCESS = 256
+
+/**
+ * Neutralino starts Windows commands through cmd.exe and its kill API only
+ * terminates direct children. yt-dlp.exe is a PyInstaller executable, so the
+ * actual download runs in a grandchild process. taskkill /T is the only
+ * available way to terminate that whole tree.
+ */
+const TASKKILL_PATH = '%SystemRoot%\\System32\\taskkill.exe'
+
+function buildTaskkillCommand(pid: number): string {
+  return `"${TASKKILL_PATH}" /PID ${pid} /T /F`
+}
 
 function errorCodeOf(error: unknown): string | undefined {
   if (typeof error !== 'object' || error === null || !('code' in error)) {
@@ -137,6 +165,28 @@ function normalizeExitCode(data: unknown): number {
   return typeof data === 'number' && Number.isFinite(data) ? data : -1
 }
 
+function createSpawnAttempt(): SpawnAttempt {
+  let resolve: () => void = () => {}
+
+  const done = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+
+  return { done, resolve }
+}
+
+function asProcessError(error: unknown): DownloadProcessError {
+  if (error instanceof DownloadProcessError) {
+    return error
+  }
+
+  return new DownloadProcessError(
+    'CANCEL_FAILED',
+    '无法结束 yt-dlp 进程。',
+    error,
+  )
+}
+
 export function createDownloadProcessRunner(
   dependencies: ProcessRunnerDependencies,
 ): DownloadProcessRunner {
@@ -144,8 +194,10 @@ export function createDownloadProcessRunner(
   const exitListeners = new Set<DownloadExitListener>()
   const processes = new Map<number, RunningProcess>()
   const bufferedEvents = new Map<number, QueuedEvent[]>()
+  const activeSpawnAttempts = new Set<SpawnAttempt>()
 
   let disposed = false
+  let disposePromise: Promise<void> | undefined
   let nativeListenerAttached = false
   let listenerSetup: Promise<void> | undefined
   let pendingSpawns = 0
@@ -324,6 +376,42 @@ export function createDownloadProcessRunner(
     return environment
   }
 
+  async function requestProcessExit(processId: number): Promise<boolean> {
+    try {
+      await dependencies.updateSpawnedProcess(processId, 'exit')
+      return true
+    } catch (error) {
+      // The process may have ended between the state lookup and the native
+      // call. That is not a cancellation failure.
+      if (errorCodeOf(error) === 'NE_OS_UNLTOUP') {
+        return false
+      }
+
+      throw asProcessError(error)
+    }
+  }
+
+  async function terminateProcessTree(
+    processId: number,
+    pid: number,
+  ): Promise<boolean> {
+    if (Number.isInteger(pid) && pid > 0) {
+      try {
+        const result = await dependencies.execCommand(
+          buildTaskkillCommand(pid),
+        )
+        if (result.exitCode === 0) {
+          return true
+        }
+      } catch {
+        // Fall back to Neutralino's own process API if taskkill is
+        // unavailable or blocked by the command allowlist.
+      }
+    }
+
+    return requestProcessExit(processId)
+  }
+
   async function startDownload(config: DownloadConfig): Promise<number> {
     assertActive()
 
@@ -333,6 +421,7 @@ export function createDownloadProcessRunner(
 
     const executablePath = normalizeYtDlpPath(dependencies.getAppPath())
     await ensureExecutableExists(executablePath)
+    assertActive()
 
     let command: string
 
@@ -358,8 +447,12 @@ export function createDownloadProcessRunner(
       ? { envs: await buildEnvironment() }
       : undefined
 
+    assertActive()
     await ensureNativeListener()
+    assertActive()
 
+    const attempt = createSpawnAttempt()
+    activeSpawnAttempts.add(attempt)
     pendingSpawns += 1
 
     try {
@@ -387,6 +480,22 @@ export function createDownloadProcessRunner(
         )
       }
 
+      // dispose() can run while spawnProcess() is awaiting its native
+      // response. The process already exists by now, so terminate it instead
+      // of leaking an unmanaged child.
+      if (disposed) {
+        try {
+          await terminateProcessTree(spawned.id, spawned.pid)
+        } catch (error) {
+          attempt.cleanupError = asProcessError(error)
+        }
+
+        throw new DownloadProcessError(
+          'RUNNER_DISPOSED',
+          '下载进程服务已关闭，启动中的 yt-dlp 进程已被结束。',
+        )
+      }
+
       if (processes.has(spawned.id)) {
         throw new DownloadProcessError(
           'SPAWN_FAILED',
@@ -396,6 +505,7 @@ export function createDownloadProcessRunner(
 
       processes.set(spawned.id, {
         id: spawned.id,
+        pid: spawned.pid,
         cancelRequested: false,
       })
 
@@ -413,6 +523,9 @@ export function createDownloadProcessRunner(
       if (pendingSpawns === 0) {
         bufferedEvents.clear()
       }
+
+      activeSpawnAttempts.delete(attempt)
+      attempt.resolve()
     }
   }
 
@@ -427,22 +540,14 @@ export function createDownloadProcessRunner(
     process.cancelRequested = true
 
     try {
-      await dependencies.updateSpawnedProcess(processId, 'exit')
-      return true
+      const exited = await terminateProcessTree(process.id, process.pid)
+      if (!exited) {
+        process.cancelRequested = false
+      }
+      return exited
     } catch (error) {
       process.cancelRequested = false
-
-      // The process may have ended between the state lookup and the native
-      // call. Treat that as "already finished" rather than cancelling again.
-      if (errorCodeOf(error) === 'NE_OS_UNLTOUP') {
-        return false
-      }
-
-      throw new DownloadProcessError(
-        'CANCEL_FAILED',
-        '无法取消 yt-dlp 进程。',
-        error,
-      )
+      throw error
     }
   }
 
@@ -462,29 +567,73 @@ export function createDownloadProcessRunner(
     }
   }
 
-  async function dispose(): Promise<void> {
-    if (disposed) {
-      return
+  function dispose(): Promise<void> {
+    if (disposePromise !== undefined) {
+      return disposePromise
     }
 
     disposed = true
     outputListeners.clear()
     exitListeners.clear()
-    processes.clear()
-    bufferedEvents.clear()
 
-    if (listenerSetup !== undefined) {
-      try {
-        await listenerSetup
-      } catch {
-        // A failed listener setup has nothing to remove.
+    disposePromise = (async () => {
+      const errors: DownloadProcessError[] = []
+      const trackedProcesses = [...processes.values()]
+
+      const stopResults = await Promise.allSettled(
+        trackedProcesses.map((process) => {
+          process.cancelRequested = true
+          return terminateProcessTree(process.id, process.pid)
+        }),
+      )
+
+      for (const result of stopResults) {
+        if (result.status === 'rejected') {
+          errors.push(asProcessError(result.reason))
+        }
       }
-    }
 
-    if (nativeListenerAttached) {
-      await dependencies.off(SPAWNED_PROCESS_EVENT, handleNativeEvent)
-      nativeListenerAttached = false
-    }
+      // Wait for spawns that were already in flight. Their continuation
+      // terminates the child before resolving the attempt, so the native
+      // listener can be removed without leaving an untracked process behind.
+      while (activeSpawnAttempts.size > 0) {
+        const attempts = [...activeSpawnAttempts]
+        await Promise.all(attempts.map((attempt) => attempt.done))
+
+        for (const attempt of attempts) {
+          if (attempt.cleanupError !== undefined) {
+            errors.push(attempt.cleanupError)
+          }
+        }
+      }
+
+      processes.clear()
+      bufferedEvents.clear()
+
+      if (listenerSetup !== undefined) {
+        try {
+          await listenerSetup
+        } catch {
+          // A failed listener setup has nothing to remove.
+        }
+      }
+
+      if (nativeListenerAttached) {
+        try {
+          await dependencies.off(SPAWNED_PROCESS_EVENT, handleNativeEvent)
+        } catch (error) {
+          errors.push(asProcessError(error))
+        } finally {
+          nativeListenerAttached = false
+        }
+      }
+
+      if (errors.length > 0) {
+        throw errors[0]
+      }
+    })()
+
+    return disposePromise
   }
 
   return {

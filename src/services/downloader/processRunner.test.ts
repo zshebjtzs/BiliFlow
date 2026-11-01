@@ -49,6 +49,7 @@ interface ListenerCall {
 function createHarness() {
   const spawnCalls: SpawnCall[] = []
   const updateCalls: UpdateCall[] = []
+  const execCalls: string[] = []
   const statsCalls: string[] = []
   const onCalls: ListenerCall[] = []
   const offCalls: ListenerCall[] = []
@@ -65,6 +66,7 @@ function createHarness() {
     envs: { PATH: 'C:\\Windows' } as Record<string, string>,
     spawnImpl: defaultSpawn,
     updateImpl: async (): Promise<void> => {},
+    execImpl: async (): Promise<{ exitCode: number }> => ({ exitCode: 0 }),
     statsImpl: async (): Promise<{ isFile: boolean }> => ({ isFile: true }),
     envsImpl: async (): Promise<Record<string, string>> => state.envs,
     onImpl: async (): Promise<unknown> => ({}),
@@ -80,6 +82,10 @@ function createHarness() {
     updateSpawnedProcess: async (id, event, data) => {
       updateCalls.push({ id, event, data })
       await state.updateImpl()
+    },
+    execCommand: async (command) => {
+      execCalls.push(command)
+      return state.execImpl()
     },
     getEnvs: async () => {
       envCalls += 1
@@ -116,6 +122,7 @@ function createHarness() {
     state,
     spawnCalls,
     updateCalls,
+    execCalls,
     statsCalls,
     onCalls,
     offCalls,
@@ -447,14 +454,17 @@ test('cancels a running process once and ignores repeated cancellation', async (
 
     assert.equal(await runner.cancelDownload(processId), true)
     assert.equal(await runner.cancelDownload(processId), false)
-    assert.deepEqual(harness.updateCalls, [
-      { id: processId, event: 'exit', data: undefined },
-    ])
+    assert.equal(harness.execCalls.length, 1)
+    assert.match(
+      harness.execCalls[0],
+      /^"%SystemRoot%\\System32\\taskkill\.exe" \/PID \d+ \/T \/F$/,
+    )
+    assert.equal(harness.updateCalls.length, 0)
 
     harness.emit(processId, 'exit', 1)
     assert.deepEqual(exits, [{ processId, exitCode: 1 }])
     assert.equal(await runner.cancelDownload(processId), false)
-    assert.equal(harness.updateCalls.length, 1)
+    assert.equal(harness.execCalls.length, 1)
   } finally {
     await runner.dispose()
   }
@@ -466,6 +476,7 @@ test('surfaces cancellation failures and permits a retry', async () => {
 
   try {
     const processId = await runner.startDownload(makeConfig())
+    harness.state.execImpl = async () => ({ exitCode: 1 })
     harness.state.updateImpl = async () => {
       throw new Error('cancel failed')
     }
@@ -477,7 +488,27 @@ test('surfaces cancellation failures and permits a retry', async () => {
 
     harness.state.updateImpl = async () => {}
     assert.equal(await runner.cancelDownload(processId), true)
+    assert.equal(harness.execCalls.length, 2)
     assert.equal(harness.updateCalls.length, 2)
+  } finally {
+    await runner.dispose()
+  }
+})
+
+test('falls back to Neutralino exit when taskkill cannot run', async () => {
+  const harness = createHarness()
+  const runner = createDownloadProcessRunner(harness.dependencies)
+
+  try {
+    const processId = await runner.startDownload(makeConfig())
+    harness.state.execImpl = async () => {
+      throw new Error('taskkill blocked')
+    }
+
+    assert.equal(await runner.cancelDownload(processId), true)
+    assert.deepEqual(harness.updateCalls, [
+      { id: processId, event: 'exit', data: undefined },
+    ])
   } finally {
     await runner.dispose()
   }
@@ -489,6 +520,7 @@ test('treats an already-ended native process as no longer cancellable', async ()
 
   try {
     const processId = await runner.startDownload(makeConfig())
+    harness.state.execImpl = async () => ({ exitCode: 1 })
     harness.state.updateImpl = async () => {
       throw Object.assign(new Error('process is gone'), {
         code: 'NE_OS_UNLTOUP',
@@ -644,13 +676,19 @@ test('ignores malformed native events', async () => {
   }
 })
 
-test('dispose removes the native listener and rejects later starts', async () => {
+test('dispose terminates tracked processes and rejects later starts', async () => {
   const harness = createHarness()
   const runner = createDownloadProcessRunner(harness.dependencies)
 
   await runner.startDownload(makeConfig())
   await runner.dispose()
 
+  assert.equal(harness.execCalls.length, 1)
+  assert.match(
+    harness.execCalls[0],
+    /^"%SystemRoot%\\System32\\taskkill\.exe" \/PID \d+ \/T \/F$/,
+  )
+  assert.equal(harness.updateCalls.length, 0)
   assert.equal(harness.offCalls.length, 1)
   assert.equal(harness.offCalls[0].event, 'spawnedProcess')
   await assert.rejects(
@@ -660,4 +698,64 @@ test('dispose removes the native listener and rejects later starts', async () =>
 
   await runner.dispose()
   assert.equal(harness.offCalls.length, 1)
+})
+
+test('dispose waits for an in-flight spawn and terminates the created process', async () => {
+  const harness = createHarness()
+  const runner = createDownloadProcessRunner(harness.dependencies)
+  let resolveSpawn: (value: SpawnedProcessInfo) => void = () => {}
+  let resolveExit: (value: { exitCode: number }) => void = () => {}
+
+  harness.state.spawnImpl = () =>
+    new Promise<SpawnedProcessInfo>((resolve) => {
+      resolveSpawn = resolve
+    })
+  harness.state.execImpl = () =>
+    new Promise<{ exitCode: number }>((resolve) => {
+      resolveExit = resolve
+    })
+
+  const startRejected = assert.rejects(
+    runner.startDownload(makeConfig()),
+    errorIs('RUNNER_DISPOSED'),
+  )
+  await waitFor(
+    () => harness.spawnCalls.length === 1,
+    'spawnProcess was not called',
+  )
+
+  const disposePromise = runner.dispose()
+  assert.equal(harness.offCalls.length, 0)
+
+  resolveSpawn({ id: 9, pid: 900 })
+  await waitFor(
+    () => harness.execCalls.length === 1,
+    'the in-flight process was not asked to exit',
+  )
+
+  let disposeSettled = false
+  void disposePromise.then(() => {
+    disposeSettled = true
+  })
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+  assert.equal(disposeSettled, false)
+  assert.equal(harness.offCalls.length, 0)
+  assert.match(
+    harness.execCalls[0],
+    /^"%SystemRoot%\\System32\\taskkill\.exe" \/PID 900 \/T \/F$/,
+  )
+  assert.equal(harness.updateCalls.length, 0)
+
+  resolveExit({ exitCode: 0 })
+  await startRejected
+  await disposePromise
+
+  assert.equal(harness.offCalls.length, 1)
+  assert.equal(harness.offCalls[0].handler, harness.onCalls[0].handler)
+
+  await assert.rejects(
+    runner.startDownload(makeConfig()),
+    errorIs('RUNNER_DISPOSED'),
+  )
 })

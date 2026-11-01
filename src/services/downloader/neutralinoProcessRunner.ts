@@ -31,6 +31,7 @@ export function getDownloadProcessRunner(): DownloadProcessRunner {
       getAppPath: resolveAppPath,
       spawnProcess: os.spawnProcess,
       updateSpawnedProcess: os.updateSpawnedProcess,
+      execCommand: os.execCommand,
       getEnvs: os.getEnvs,
       getStats: filesystem.getStats,
       on: events.on,

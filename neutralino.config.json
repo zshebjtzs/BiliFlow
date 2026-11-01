@@ -17,10 +17,14 @@
     "debug.log",
     "os.spawnProcess",
     "os.updateSpawnedProcess",
+    "os.execCommand",
     "os.getEnvs",
     "filesystem.getStats"
   ],
-  "commandAllowList": ["*\\yt-dlp.exe"],
+  "commandAllowList": [
+    "*\\yt-dlp.exe",
+    "%SystemRoot%\\System32\\taskkill.exe"
+  ],
   "modes": {
     "window": {
       "title": "BiliFlow",
