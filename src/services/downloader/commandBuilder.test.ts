@@ -43,8 +43,8 @@ for (const { quality, format } of qualityCases) {
 const codecCases: Array<{ codec: VideoCodec; formatSort?: string }> = [
   { codec: 'auto' },
   { codec: 'h264', formatSort: 'vcodec:h264' },
-  { codec: 'hevc', formatSort: 'vcodec:hevc' },
-  { codec: 'av1', formatSort: 'vcodec:av1' },
+  { codec: 'hevc', formatSort: 'vcodec:h265' },
+  { codec: 'av1', formatSort: 'vcodec:av01' },
 ]
 
 for (const { codec, formatSort } of codecCases) {

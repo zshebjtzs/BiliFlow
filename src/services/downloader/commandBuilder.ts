@@ -11,8 +11,8 @@ const MAX_HEIGHT_BY_QUALITY: Record<LimitedQuality, number> = {
 
 const FORMAT_SORT_BY_CODEC: Record<PreferredCodec, string> = {
   h264: 'vcodec:h264',
-  hevc: 'vcodec:hevc',
-  av1: 'vcodec:av1',
+  hevc: 'vcodec:h265',
+  av1: 'vcodec:av01',
 }
 
 /**
