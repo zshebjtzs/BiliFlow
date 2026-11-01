@@ -336,16 +336,134 @@ test('wraps spawn exceptions and allows a later retry', async () => {
   }
 })
 
-test('rejects malformed Neutralino process identifiers', async () => {
+test('cleans up a spawned process when the Neutralino id is invalid', async () => {
   const harness = createHarness()
   harness.state.spawnImpl = async () =>
-    ({ id: Number.NaN, pid: 1 }) as SpawnedProcessInfo
+    ({ id: Number.NaN, pid: 1234 }) as SpawnedProcessInfo
   const runner = createDownloadProcessRunner(harness.dependencies)
 
   try {
     await assert.rejects(
       runner.startDownload(makeConfig()),
       errorIs('SPAWN_FAILED'),
+    )
+    assert.deepEqual(harness.execCalls, [
+      '"%SystemRoot%\\System32\\taskkill.exe" /PID 1234 /T /F',
+    ])
+    assert.equal(harness.updateCalls.length, 0)
+  } finally {
+    await runner.dispose()
+  }
+})
+
+test('rejects an invalid PID without faking a cleanup target', async () => {
+  const harness = createHarness()
+  harness.state.spawnImpl = async () =>
+    ({ id: 5, pid: 0 }) as SpawnedProcessInfo
+  const runner = createDownloadProcessRunner(harness.dependencies)
+
+  try {
+    await assert.rejects(
+      runner.startDownload(makeConfig()),
+      errorIs('SPAWN_FAILED'),
+    )
+    assert.equal(harness.execCalls.length, 0)
+    assert.equal(harness.updateCalls.length, 0)
+  } finally {
+    await runner.dispose()
+  }
+})
+
+test('cleans up only the new process when the Neutralino id is duplicated', async () => {
+  const harness = createHarness()
+  const runner = createDownloadProcessRunner(harness.dependencies)
+  const output: DownloadOutputEvent[] = []
+  runner.onOutput((event) => output.push(event))
+
+  try {
+    const processId = await runner.startDownload(makeConfig())
+    harness.state.spawnImpl = async () =>
+      ({ id: processId, pid: 9999 }) as SpawnedProcessInfo
+
+    await assert.rejects(
+      runner.startDownload(makeConfig()),
+      errorIs('SPAWN_FAILED'),
+    )
+    assert.deepEqual(harness.execCalls, [
+      '"%SystemRoot%\\System32\\taskkill.exe" /PID 9999 /T /F',
+    ])
+
+    harness.emit(processId, 'stdOut', 'original process still registered')
+    assert.deepEqual(output, [
+      {
+        processId,
+        stream: 'stdout',
+        text: 'original process still registered',
+      },
+    ])
+
+    assert.equal(await runner.cancelDownload(processId), true)
+    assert.match(
+      harness.execCalls[1],
+      /\\taskkill\.exe" \/PID 4002 \/T \/F$/,
+    )
+    harness.emit(processId, 'exit', 0)
+  } finally {
+    await runner.dispose()
+  }
+})
+
+test('does not kill the original process when a duplicate id has the same PID', async () => {
+  const harness = createHarness()
+  const runner = createDownloadProcessRunner(harness.dependencies)
+
+  try {
+    const processId = await runner.startDownload(makeConfig())
+    harness.state.spawnImpl = async () =>
+      ({ id: processId, pid: 4002 }) as SpawnedProcessInfo
+
+    await assert.rejects(
+      runner.startDownload(makeConfig()),
+      (error: unknown) => {
+        assert.ok(error instanceof DownloadProcessError)
+        assert.equal(error.code, 'SPAWN_FAILED')
+        assert.match(error.message, /未执行清理以避免误杀现有进程/)
+        return true
+      },
+    )
+    assert.equal(harness.execCalls.length, 0)
+    harness.emit(processId, 'exit', 0)
+  } finally {
+    await runner.dispose()
+  }
+})
+
+test('preserves the spawn error when cleanup of the new process fails', async () => {
+  const harness = createHarness()
+  harness.state.spawnImpl = async () =>
+    ({ id: Number.NaN, pid: 777 }) as SpawnedProcessInfo
+  harness.state.execImpl = async () => {
+    throw new Error('taskkill blocked')
+  }
+  const runner = createDownloadProcessRunner(harness.dependencies)
+
+  try {
+    await assert.rejects(
+      runner.startDownload(makeConfig()),
+      (error: unknown) => {
+        assert.ok(error instanceof DownloadProcessError)
+        assert.equal(error.code, 'SPAWN_FAILED')
+        assert.match(error.message, /无效的下载进程标识/)
+        assert.match(error.message, /清理已创建的进程树也失败：taskkill blocked/)
+
+        const cause = error.cause as
+          | { original?: unknown; cleanupError?: unknown }
+          | undefined
+        assert.ok(cause?.original instanceof DownloadProcessError)
+        assert.match(cause.original.message, /无效的下载进程标识/)
+        assert.ok(cause.cleanupError instanceof Error)
+        return true
+      },
     )
   } finally {
     await runner.dispose()

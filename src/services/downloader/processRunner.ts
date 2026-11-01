@@ -187,6 +187,20 @@ function asProcessError(error: unknown): DownloadProcessError {
   )
 }
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function isValidNeutralinoId(value: unknown): value is number {
+  return (
+    typeof value === 'number' && Number.isInteger(value) && value >= 0
+  )
+}
+
+function isValidProcessId(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+}
+
 export function createDownloadProcessRunner(
   dependencies: ProcessRunnerDependencies,
 ): DownloadProcessRunner {
@@ -412,6 +426,42 @@ export function createDownloadProcessRunner(
     return requestProcessExit(processId)
   }
 
+  async function terminateSpawnedProcessTree(pid: number): Promise<void> {
+    const result = await dependencies.execCommand(buildTaskkillCommand(pid))
+    if (result.exitCode !== 0) {
+      throw new DownloadProcessError(
+        'CANCEL_FAILED',
+        `taskkill 无法结束进程树（退出码 ${result.exitCode}）。`,
+      )
+    }
+  }
+
+  /**
+   * Throws `reason` after making a best-effort attempt to stop a process that
+   * Neutralino created but whose return value cannot be registered. A failed
+   * cleanup is appended to the message so the original spawn error is not lost.
+   */
+  async function failSpawn(
+    reason: DownloadProcessError,
+    cleanupPid?: number,
+  ): Promise<never> {
+    if (cleanupPid === undefined) {
+      throw reason
+    }
+
+    try {
+      await terminateSpawnedProcessTree(cleanupPid)
+    } catch (cleanupError) {
+      throw new DownloadProcessError(
+        'SPAWN_FAILED',
+        `${reason.message} 清理已创建的进程树也失败：${describeError(cleanupError)}`,
+        { original: reason, cleanupError },
+      )
+    }
+
+    throw reason
+  }
+
   async function startDownload(config: DownloadConfig): Promise<number> {
     assertActive()
 
@@ -468,16 +518,58 @@ export function createDownloadProcessRunner(
         )
       }
 
-      if (
-        typeof spawned !== 'object' ||
-        spawned === null ||
-        typeof spawned.id !== 'number' ||
-        !Number.isInteger(spawned.id)
-      ) {
+      if (typeof spawned !== 'object' || spawned === null) {
         throw new DownloadProcessError(
+          'SPAWN_FAILED',
+          'Neutralino 返回了无效的下载进程信息。',
+        )
+      }
+
+      const candidate: { id?: unknown; pid?: unknown } = spawned
+
+      if (!isValidNeutralinoId(candidate.id)) {
+        const reason = new DownloadProcessError(
           'SPAWN_FAILED',
           'Neutralino 返回了无效的下载进程标识。',
         )
+
+        if (isValidProcessId(candidate.pid)) {
+          await failSpawn(reason, candidate.pid)
+        }
+
+        throw new DownloadProcessError(
+          'SPAWN_FAILED',
+          `${reason.message} 且缺少有效 PID，无法可靠定位并清理已创建的进程树。`,
+          reason,
+        )
+      }
+
+      if (!isValidProcessId(candidate.pid)) {
+        throw new DownloadProcessError(
+          'SPAWN_FAILED',
+          'Neutralino 返回了无效的下载进程 PID，无法可靠定位并清理已创建的进程树。',
+        )
+      }
+
+      const spawnedProcessId = candidate.id
+      const spawnedPid = candidate.pid
+
+      const existing = processes.get(spawnedProcessId)
+      if (existing !== undefined) {
+        const reason = new DownloadProcessError(
+          'SPAWN_FAILED',
+          `下载进程标识重复：${spawnedProcessId}。现有进程记录已保留。`,
+        )
+
+        if (spawnedPid === existing.pid) {
+          throw new DownloadProcessError(
+            'SPAWN_FAILED',
+            `${reason.message} 新进程与现有进程的 PID 相同（${spawnedPid}），未执行清理以避免误杀现有进程。`,
+            reason,
+          )
+        }
+
+        await failSpawn(reason, spawnedPid)
       }
 
       // dispose() can run while spawnProcess() is awaiting its native
@@ -485,7 +577,7 @@ export function createDownloadProcessRunner(
       // of leaking an unmanaged child.
       if (disposed) {
         try {
-          await terminateProcessTree(spawned.id, spawned.pid)
+          await terminateProcessTree(spawnedProcessId, spawnedPid)
         } catch (error) {
           attempt.cleanupError = asProcessError(error)
         }
@@ -496,28 +588,21 @@ export function createDownloadProcessRunner(
         )
       }
 
-      if (processes.has(spawned.id)) {
-        throw new DownloadProcessError(
-          'SPAWN_FAILED',
-          `下载进程标识重复：${spawned.id}`,
-        )
-      }
-
-      processes.set(spawned.id, {
-        id: spawned.id,
-        pid: spawned.pid,
+      processes.set(spawnedProcessId, {
+        id: spawnedProcessId,
+        pid: spawnedPid,
         cancelRequested: false,
       })
 
-      const queued = bufferedEvents.get(spawned.id)
+      const queued = bufferedEvents.get(spawnedProcessId)
       if (queued !== undefined) {
-        bufferedEvents.delete(spawned.id)
+        bufferedEvents.delete(spawnedProcessId)
         for (const event of queued) {
           dispatchQueuedEvent(event)
         }
       }
 
-      return spawned.id
+      return spawnedProcessId
     } finally {
       pendingSpawns -= 1
       if (pendingSpawns === 0) {
