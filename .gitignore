@@ -12,6 +12,9 @@ release/
 .storage/
 neutralinojs.log
 
+# Local yt-dlp binary used for development and runtime checks
+yt-dlp.exe
+
 # Logs
 logs
 *.log

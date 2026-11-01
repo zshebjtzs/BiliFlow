@@ -1,8 +1,15 @@
 <script setup lang="ts">
-import { computed, reactive } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref } from 'vue'
 import { NButton, NInput, NSelect, NSwitch, NTag, useMessage } from 'naive-ui'
 import type { SelectOption } from 'naive-ui'
 import BrandMark from '../components/BrandMark.vue'
+import { getDownloadProcessRunner } from '../services/downloader/neutralinoProcessRunner'
+import { DownloadProcessError } from '../services/downloader/processRunner'
+import type {
+  DownloadExitEvent,
+  DownloadOutputEvent,
+  DownloadProcessRunner,
+} from '../services/downloader/processRunner'
 import { DEFAULT_DOWNLOAD_CONFIG } from '../types/config'
 import type { CookieSource, DownloadConfig, VideoCodec, VideoQuality } from '../types/config'
 import { isNeutralinoRuntime } from '../utils/neutralino'
@@ -43,6 +50,44 @@ const message = useMessage()
 const appVersion = __APP_VERSION__
 const isDesktop = isNeutralinoRuntime()
 const runtimeLabel = isDesktop ? 'Neutralino Desktop' : 'Browser Preview'
+
+const downloadRunner: DownloadProcessRunner | undefined = isDesktop
+  ? getDownloadProcessRunner()
+  : undefined
+
+const downloadStatus = ref('')
+const latestOutput = ref('')
+const isStarting = ref(false)
+const activeProcessId = ref<number | null>(null)
+const isBusy = computed(
+  () => isStarting.value || activeProcessId.value !== null,
+)
+const actionNote = computed(() => {
+  const status = [downloadStatus.value, latestOutput.value]
+    .filter((part) => part.length > 0)
+    .join(' · ')
+
+  if (status.length > 0) {
+    return status
+  }
+
+  return isDesktop
+    ? 'yt-dlp.exe 需与 BiliFlow 可执行文件放在同一目录'
+    : '浏览器预览不会启动本地进程'
+})
+
+let stopOutputListener: (() => void) | undefined
+let stopExitListener: (() => void) | undefined
+
+if (downloadRunner !== undefined) {
+  stopOutputListener = downloadRunner.onOutput(handleDownloadOutput)
+  stopExitListener = downloadRunner.onExit(handleDownloadExit)
+}
+
+onBeforeUnmount(() => {
+  stopOutputListener?.()
+  stopExitListener?.()
+})
 
 const qualityLabel = computed(() => findLabel(qualityChoices, config.quality))
 const codecLabel = computed(() => findLabel(codecChoices, config.codec))
@@ -89,8 +134,107 @@ function updateMergeAudioVideo(value: string | number | boolean): void {
   config.mergeAudioVideo = value === true
 }
 
-function handleDownload(): void {
-  message.info('下载功能尚未接入，当前页面仅用于配置预览。', { duration: 3500 })
+function describeDownloadError(error: unknown): string {
+  if (error instanceof DownloadProcessError) {
+    return error.message
+  }
+
+  return error instanceof Error ? error.message : String(error)
+}
+
+function handleDownloadOutput(event: DownloadOutputEvent): void {
+  const belongsToStartingProcess =
+    activeProcessId.value === null && isStarting.value
+
+  if (event.processId !== activeProcessId.value && !belongsToStartingProcess) {
+    return
+  }
+
+  const line = event.text
+    .split(/\r?\n/)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .at(-1)
+
+  if (line !== undefined) {
+    latestOutput.value = line.length > 160 ? `${line.slice(0, 160)}…` : line
+  }
+}
+
+function handleDownloadExit(event: DownloadExitEvent): void {
+  const isActiveProcess = activeProcessId.value === event.processId
+  const exitedWhileStarting =
+    activeProcessId.value === null && isStarting.value
+
+  if (!isActiveProcess && !exitedWhileStarting) {
+    return
+  }
+
+  activeProcessId.value = null
+  isStarting.value = false
+  downloadStatus.value =
+    event.exitCode === 0
+      ? 'yt-dlp 已结束'
+      : `yt-dlp 已结束（退出码 ${event.exitCode}）`
+
+  if (event.exitCode === 0) {
+    message.success('yt-dlp 进程正常结束。')
+  } else {
+    message.warning(`yt-dlp 进程结束，退出码 ${event.exitCode}。`)
+  }
+}
+
+async function handleDownload(): Promise<void> {
+  if (downloadRunner === undefined) {
+    message.info('请在 Neutralino 桌面端启动下载。', { duration: 3500 })
+    return
+  }
+
+  if (isBusy.value) {
+    return
+  }
+
+  isStarting.value = true
+  downloadStatus.value = '正在启动 yt-dlp…'
+  latestOutput.value = ''
+
+  try {
+    const processId = await downloadRunner.startDownload({ ...config })
+
+    // The process can finish before startDownload resolves. In that case the
+    // exit listener has already reset the starting state.
+    if (!isStarting.value) {
+      return
+    }
+
+    activeProcessId.value = processId
+    isStarting.value = false
+    downloadStatus.value = `yt-dlp 已启动（进程 ID ${processId}）`
+  } catch (error) {
+    isStarting.value = false
+    downloadStatus.value = ''
+    message.error(describeDownloadError(error), { duration: 6000 })
+  }
+}
+
+async function handleCancel(): Promise<void> {
+  if (downloadRunner === undefined || activeProcessId.value === null) {
+    return
+  }
+
+  const processId = activeProcessId.value
+  downloadStatus.value = '正在取消 yt-dlp…'
+
+  try {
+    const cancelled = await downloadRunner.cancelDownload(processId)
+
+    if (!cancelled) {
+      downloadStatus.value = 'yt-dlp 进程已经结束'
+    }
+  } catch (error) {
+    downloadStatus.value = '取消下载失败'
+    message.error(describeDownloadError(error), { duration: 6000 })
+  }
 }
 </script>
 
@@ -236,7 +380,7 @@ function handleDownload(): void {
               </div>
 
               <div class="form-actions">
-                <p class="action-note">
+                <p class="action-note" aria-live="polite">
                   <svg viewBox="0 0 24 24" aria-hidden="true">
                     <path
                       d="M12 3.8 5.25 6.7v5.05c0 4.06 2.8 7.3 6.75 8.45 3.95-1.15 6.75-4.39 6.75-8.45V6.7L12 3.8Z"
@@ -254,9 +398,16 @@ function handleDownload(): void {
                       stroke-linejoin="round"
                     />
                   </svg>
-                  当前仅保存界面配置，不会发起下载
+                  {{ actionNote }}
                 </p>
-                <NButton type="primary" size="large" attr-type="submit" class="download-button">
+                <NButton
+                  v-if="activeProcessId === null"
+                  type="primary"
+                  size="large"
+                  attr-type="submit"
+                  class="download-button"
+                  :disabled="isStarting"
+                >
                   <template #icon>
                     <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
                       <path
@@ -269,7 +420,16 @@ function handleDownload(): void {
                       />
                     </svg>
                   </template>
-                  开始下载
+                  {{ isStarting ? '正在启动…' : '开始下载' }}
+                </NButton>
+                <NButton
+                  v-else
+                  size="large"
+                  attr-type="button"
+                  class="download-button"
+                  @click="handleCancel"
+                >
+                  取消下载
                 </NButton>
               </div>
             </form>
@@ -279,7 +439,7 @@ function handleDownload(): void {
             <section class="summary-card">
               <div class="summary-heading">
                 <span class="summary-title">CONFIG SUMMARY</span>
-                <span class="summary-badge">待接入</span>
+                <span class="summary-badge">本地进程</span>
               </div>
 
               <div class="summary-block">
@@ -329,8 +489,8 @@ function handleDownload(): void {
             <div class="tip-card">
               <span class="tip-icon" aria-hidden="true">i</span>
               <div>
-                <strong>前端配置预览</strong>
-                <p>不会读取链接、调用下载器或写入磁盘。</p>
+                <strong>本地 yt-dlp</strong>
+                <p>开始下载后会调用应用目录中的 yt-dlp.exe。</p>
               </div>
             </div>
           </aside>
@@ -665,12 +825,14 @@ h1 {
 
 .action-note {
   display: flex;
+  min-width: 0;
   margin: 0;
   align-items: center;
   gap: 7px;
   color: #98929c;
   font-size: 10.5px;
   line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .action-note svg {

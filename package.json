@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "neu:dev": "neu run",
-    "test": "node --test src/services/downloader/commandBuilder.test.ts",
+    "test": "node --test src/services/downloader/commandBuilder.test.ts src/services/downloader/commandSerializer.test.ts src/services/downloader/processRunner.test.ts",
     "build": "vue-tsc -b && vite build",
     "neu:build": "neu build --clean",
     "neu:update": "neu update",
